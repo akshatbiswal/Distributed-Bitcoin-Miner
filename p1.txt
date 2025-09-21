@@ -1,0 +1,638 @@
+Project 1: Distributed Bitcoin Miner
+1 Overview
+This project will consist of the following two parts:
+
+Part A:Implement the Live Sequence Protocol, a homegrown protocol for providing
+reliable communication with simple client and server APIs on top of the Internet
+UDP protocol.
+Part B:Implement a Distributed Bitcoin Miner.
+Schedule:
+
+Part A Checkpoint: Due:Tuesday 9/23, 20% of project grade
+Full Project Part A: Due:Thursday 10/2, 60% of project grade
+Full Project Part B: Due:Thursday 10/23, 20% of project grade
+You will have 15 submissions for each due date. The same policy of P0 will apply here as
+well - at most 3 late days per due date.You can only use late days if both partners
+have late days.No submissions will be accepted 3 days after each deadline.
+
+About Gradescope:
+Your Gradescope submission will output a message showing how many submissions you
+have made and how many you have left. Gradescope will allow you to submit beyond
+this limit, but we will be checking manually. Gradescope will also allow you to select a
+submission to grade.Only your selected submission within the first 15 submissions
+counts. If your selected submission is not within the first 15 submissions, your
+last submission of the first 15 submissions will be graded.
+Gradescope will count how many submissions are under your name, and help you calculate
+number of remaining submissions. To better keep track of number of submissions of your
+group,please add your partner as a group member for EACH submission. We
+won’t accept request to update scores if you miscount the number of submissions of your
+group.
+Please remove all your print statements before making the submission. The
+autograder may not work properly with print statements.
+For this project you will have one partner of your choosing. Only one member of each
+group will need to submit your work to Gradescope (check the README for submission
+guidelines), and after submitting, make sure to add your partner under Group Members.
+
+At the end of the project, keep in mind that we will ask for feedback about
+project partners.
+
+We will begin by discussing part A of this project, in which you will implement theLive
+Sequence Protocol. In your implementation, you will incorporate features required to create
+a robust system, handling lost, duplicated, or corrupted Internet packets, as well as failing
+clients and servers. You will also learn the value of creating a set of layered abstractions
+in bridging between low-level network protocols and high-level applications.
+
+WARNING:P1 is much more complex than P0, so it is imperative that you start early
+with a solid design in place. We give you an outline of what this can look like in this
+handout.
+
+Also, although you have approximately 50% of the time of Part A for the checkpoint, the
+checkpoint is much less than 50% of the features, therefore it is highly recommended that
+you go beyond what is required for the checkpoint and work on Part A final as soon as you
+can.
+
+2 Part A: LSP Protocol
+The low-level Internet Protocol (IP) provides what is referred to as an “unreliable data-
+gram” service, allowing one machine to send a message as a packet to another, but with the
+possibility that the packet will be delayed, dropped, or duplicated. In addition, as an IP
+packet hops from one network node to another, its size is limited to a specified maximum
+number of bytes. Typically, packets of up to 1,500 bytes can safely be transmitted along
+any routing path, but going beyond this can become problematic.
+
+Very few applications use IP directly. Instead, they are typically written to use UDP or
+TCP:
+
+UDP: The “User Datagram Protocol.” Also, an unreliable datagram service, but it allows
+packets to be directed to different logical destinations on a single machine, known as
+ports. This makes it possible to run multiple clients or servers on a single machine.
+This function is often called multiplexing.
+
+TCP:The “Transmission Control Protocol” offers a reliable, in-order stream abstraction.
+Using TCP, a stream of arbitrary-length messages is transmitted by breaking each
+
+message into (possibly multiple) packets at the source and then reassembling them at
+the destination. TCP handles such issues as dropped packets, duplicated packets, and
+preventing the sender from overwhelming both Internet bandwidth and the buffering
+capabilities at the destination.
+Your task for Part A of this project is to implement theLive Sequence Protocol(LSP).
+LSP provides features that lie somewhere between UDP and TCP, but it also has features
+not found in either protocol:
+
+Unlike UDP or TCP, it supports aclient-server communication model.
+The server maintains connections between a number of clients, each of which is
+identified by a numeric connection identifier.
+Communication between the server and a client consists of a sequence of discrete
+messages in each direction.
+Message sizes are limited to fit within single UDP packets (around 1,000 bytes).
+Messages are sentreliably: a message sent over the network must be received exactly
+once, and messages must be received in the same order they were sent.
+Messageintegrity is ensured: a message sent over the network will be rejected if
+modified in transit.
+The server and clients monitor the status of their connections and detect when the
+other side has become disconnected.
+The following sections will describe LSP in-depth. You will only implement part of LSP
+for the Part A Checkpoint. We begin by describing the protocol in terms of the messages
+that flow between the server and its clients.
+
+2.1 LSP Overview
+In LSP, communication between a server and client consists of a sequence of discrete
+messages sent in each direction. Each message sent over an LSP connection is made up of
+the following six values:
+
+Message Type: An integer constant identifying one of four possible message types:
+
+Connect:Sent by a client to establish a connection with the server.
+Data: Sent by either a client or the server to transmit information.
+Ack:Sent by either a client or the server to acknowledge a Connect or Data message.
+CAck:Sent by either a client or the server to acknowledge a contiguous set of Data
+messages. CAck stands for Cumulative Ack.
+Connection ID: A positive, non-zero number that uniquely identifies the client-server
+connection.
+
+Sequence Number:A positive, non-zero number that is incremented with each data
+message sent, starting with a client-chosen, 32-bit nonce for the initial connection
+request.
+
+Payload Size:The number of bytes of the payload.
+
+Checksum: A 16-bit number derived from the message to verify data integrity.
+
+Payload:A sequence of bytes, with a format determined by the application.
+
+In the sections that follow, we will use the following notation to indicate the different
+possible messages that can be sent between a client and a server (note that Connect, Ack
+and CAck messages have payload values ofnil):
+
+(Connect, 0 ,sn): Connection request. It must have ID 0. The sequence numbersn
+will be a client-chosen, 32-bit nonce indicating the initial sequence number used for
+this connection.
+(Data,id,sn,len,cs,D): Data message with IDid, sequence numbersn, payload size
+len, checksumcsand payloadD.
+(Ack,id,sn): Ack message with IDid, and sequence numbersn.
+(CAck,id,sn): CAck message with IDid, and sequence numbersn. This message
+acknowledges the receipt of all data messages from IDidup to and including sequence
+numbersn.
+Note, when reading sections 2.1.1 and 2.1.2, assume no messages are dropped.
+
+2.1.1 Establishing a connection
+
+Before data can be sent between a client and server, a connection must first be made. The
+client initiates a connection by sending aconnection requestto the server. Theconnection
+
+requestmust have ID = 0 and a client-chosen, 32-bit noncesnas sequence number, which
+indicates the initial sequence number for this connection. (For this project, you don’t need
+to worry about data overflow for sequence number.) In response, the server generates and
+assigns an ID that uniquely identifies the new client-server connection, and sends the client
+an acknowledgment message containing this new ID, the sequence numbersn, and anil
+payload. Figure 1 illustrates how a connection is established.
+
+Your server may choose any scheme for generating new connection IDs. Our implementa-
+tion simply assigns IDs sequentially starting with 1.
+
+Figure 1: Establishing a connection. A client sends a connection request to the server, which
+responds to the client with an acknowledgment message containing the connection’s unique ID.
+Here thesndenotes the initial sequence number for the connection, which is a client-chosen, 32-bit
+nonce. The vertical lines with downward arrows denote the passage of time on both the client and
+the server, while the lines crossing horizontally denote messages being sent between the two.
+
+2.1.2 Sending & acknowledging data
+
+Once a connection is established, data may be sent in both directions (i.e. from client to
+server or from server to client) as sequences of discretedata messages. Note that the client
+and server will maintain their own series of sequence numbers, independent of the other.
+The sequence number for data messages at each end will start fromisn+ 1, whereisnis
+the initial sequence number.
+
+Figure 2 gives an example of a normal communication sequence between the server and
+a client. The figure illustrates the transmission of four data messages from the client to
+the server, and one data message from the server to the client. Note that all messages
+are acknowledged, and that the client and server maintain their own series of sequence
+numbers, independent of the other.
+
+Figure 3 shows the usage of CAck under the same scenario. Note that your own imple-
+mentation does not need to use CAck when sending acknowledgments to data messages.
+However, your server and clients should both be able to handle CAck.
+
+Also, note that it is entirely possible for one side to receive data messages while waiting for
+acknowledgments for data messages it sent—the client and server operate asynchronously,
+and there is no guarantee that packets arrive in the same order they are sent. However, it
+is still the responsibility of the client and server toprocessthe received messages in order.
+Messages must beacknowledgedwhen received (with either Ack or CAck messages—Ack
+is recommended), butprocessingcannot occur out of order. For example, if the server has
+not yet received a message with sequence numberi, but received a message with sequence
+numberi+ 1, it may not process messagei+ 1 until it receives and processes messagei.
+Figure 4 shows an example. (Please assume that all messages with sequence number< i
+have been received and processed. Size field is ignored for illustration purposes.)
+
+Like TCP, LSP includes asliding window protocol. The sliding window represents an
+upper bound on the range of messages that can be sent without acknowledgment. This
+upper bound is referred to as the “window size,” which we denote with the symbolω. For
+example, ifω= 1, every message must be acknowledged before the next message can be
+sent. Ifω= 2, up to two messages can be sent without acknowledgment. That is, a third
+message cannot be sent until the first message is acknowledged, a fourth message cannot
+be sent until the first and second messages are acknowledged, etc.
+
+Note that the range of messages that are allowed to be sent without acknowledgment is
+fixed. If the oldest message that has not yet been acknowledged has sequence numbern,
+then only messages with sequence numbersnthroughn+ω−1 (inclusive) may be sent.
+Only when the oldest (leftmost) messages are acknowledged can the window slide over to
+the right, possibly allowing more recent data messages to be sent.
+
+To simulate real world scenarios where the receiving end has storage limitations, we place
+a further restriction calledMaxUnackedMessages, which we denote with the symbolM.
+At any point in time, the number of unacknowledged messages should not be larger than
+MaxUnackedMessages. For example, assumeM= 2,ω= 4, and we have sent four messages.
+If neither of the first and second messages are acknowledged, we cannot send the third
+message even though the third message is within the sliding window. Note thatM≤ω.
+
+MaxUnackedMessagesandWindowSizeensure that in the case of many failures (dropped
+messages), we don’t flood the network with too many messages being resent.
+
+Note that for simplicity, we will only consider the case of using Ack when
+explaining the following concepts. Your implementation should handle the
+case of receiving CAcks.
+
+Server Client
+(Data, id , i , D i )
+(Ack, id , i )
+(Data, id , i +1, D i +1)
+(Ack, id , i +1)
+(Data, id , i +2, D i +2)
+(Ack, id , i +2)
+(Data, id , j , D j )
+(Ack, id , j )
+Figure 2:Sending & acknowledging data. Data may be sent from both the client or the server,
+and all data messages must be acknowledged. Size field is ignored for illustration purposes.
+
+Figure 3:Assuming that no messages are dropped in the same example, sending CAck messages
+instead of regular Acks is also valid since by the time a CAck is sent, all previous data messages
+are received.
+
+Figure 4:Client sends data messageito the server. The server receives it and should acknowledge
+this data message. Note that since all previous messages have been received and processed, the
+corresponding acknowledgment (highlighted with yellow) can be either Ack or CAck.
+Client then sends data messagesi+ 1 andi+ 2, but onlyi+ 2 is received. The server still needs
+to acknowledge data messagei+ 2, but this time only Ack should be used.
+
+2.1.3 Epoch events
+
+Unfortunately, the basic protocol described so far is not robust. On one hand, its sequence
+numbers makes it possible to detect when a message has been dropped or duplicated.
+However, if any message—connection request, data message, or acknowledgment—gets
+dropped, the linkage in either one or both directions will stop working, with both sides
+waiting for messages from the other.
+
+To make LSP robust, we incorporate a simple time trigger into the servers and clients.
+Timers fire periodically on both the clients and servers, dividing the flow of time for
+each into a sequence ofepochs. We refer to the time interval between epochs as theepoch
+duration, which we denote with the symbolδ. Our default value forδis 2,000 milliseconds,
+although this can be varied.
+
+Epoch events ensure two separate things:
+
+Server and clients retransmit messages that may have been dropped
+Server and clients detect when the connections they’re communicating with timeout
+Try to decouple these two events in your mental model of what’s going on, as well as in
+your implementation, because they are actually very different protocols!
+
+One function of epochs is that the server and clients retransmit data that may have been
+dropped. Instead of trying to resubmit this data every single epoch however, you will be
+implementing anexponential back-off approach.
+
+Let’s define three other variables in addition toδ.
+
+EpochLimit- the maximum amount of epochs that can elapse without a response
+before we declare the connection dead. We need an epoch limit in order to ensure
+that we eventually drop dead connections.
+CurrentBackoff- the amount of epochs we wait before re-transmitting data that
+did not receive an ACKFor instance, if ̇ CurrentBackoffis 8, and wejust tried to
+send some data but did not receive an ACK, then we will only attempt to resend the
+data again after waiting 8 epochs. We provide some more examples below.
+MaxBackOffInterval- the maximum amount of epochs we wait without retrying
+to transmit data. As in the name,CurrentBackoffis always less than or equal to
+MaxBackOffInterval.
+EpochLimitandMaxBackOffIntervalare given as runtime parameters, but you are re-
+sponsible for keeping track of the current back-off.
+
+Furthermore,EpochLimitrelates to detecting when connections are dead, whereasCurrent
+andMax Backoffrelate to the retry strategy for un-ACK’d data messages.
+
+The key to exponential back-off is that if we still have unacknowledged sent data after
+CurrentBackoffepochs have elapsed, wedoublethe value ofCurrentBackoff(unless it
+is currently 0, in which case we add one).
+
+By default,CurrentBackoffis initially 0. This means that if a server did not receive the
+ACK for a data message from a client at a given epoch, we would resend the data to the
+client on the 1st, 3rd, 6th, 11th, etc. epoch events afterward.
+
+This is because at first we wait 0 epochs, trying to resend at the very next epoch - epoch
+
+Then we wait one epoch (epoch 2) before retrying.
+Next, we wait two epochs (epochs 4, 5) before retrying.
+Next, we wait four epochs (epochs 7, 8, 9, 10) before retrying... etc.
+
+Put another way, consider the same case as above where the client stops receiving any
+messages from the server. LetXbe an epoch event where the client retried, and letO
+be an epoch event where the client did nothing. Assume that during the very first epoch
+
+shown below, the client sent some un-ACK’d message to the server (which we also denote
+with anX). Then we would have this pattern:
+
+XXOXOOXOOOOXOOOOOOOOX ...
+Again, the pattern is that we wait 0 epochs, then 1 epoch, then 2 epochs, then 4, etc., until
+either we reachEpochLimitand terminate the connection, or we receive the ACK for the
+data message in question back, in which case we’re good!
+
+When the epoch timer fires, a client takes the following actions:
+
+If the client’s connection request has not yet been acknowledged by the server, then
+resend the connection request.
+For each data message that has been sent but not yet acknowledged, resend the data
+message,following the exponential backoff rules above.
+If the connection request has been sent and acknowledged, but the client has not
+sent or resent any data message to the server in the last epoch, then send an ac-
+knowledgment with sequence number 0 (this is called a Heartbeat and is explained
+below).
+The server performs a similar set of actions for each of its connections:
+
+For each data message that has been sent, but not yet acknowledged, resend the data
+messagefollowing the exponential backoff rules above.
+If the server has not sent or resent any data message to the client in the last epoch,
+then send an acknowledgment with sequence number 0 (this is called a Heartbeat
+and is explained below).
+IMPORTANT:Note that we keep track of aCurrentBackofffor each data message,
+not for a connection. Also note that for resending connect messages, we should retry every
+epoch.
+
+Figure 5 illustrates how the epoch events make up for failures by the normal communica-
+tion. We show the occurrence of an epoch event as a large black oval on each time line.
+In this example, the client attempts to send dataDi, but the acknowledgment message
+gets dropped. In addition, the server attempts to send dataDj, but the data message
+gets dropped. When the epoch timer triggers on the client, it will resend dataDias
+CurrentBackOffis 0.
+
+Assuming the server has an epoch event around the same time (there is no requirement
+that they occur simultaneously), we can see that the server will also resend dataDj.
+
+After that, both the client and server send acknowledgments to each other for dataDiand
+Djrespectively, and this time the messages are not dropped.
+
+Server Client
+(Data, id , i , D i )
+(Ack, id , i )
+(Data, id , j , D j )
+(Ack, id , j )
+(Data, id , j , D j )
+(Ack, id , i )
+(Data, id , i , D i )
+Figure 5:Epoch events. Both sides resend acknowledgments for the most recently received data,
+and (possibly) resend any unacknowledged data. Size field is ignored for illustration purposes.
+
+We can see in this example that duplicate messages can occur: the server receive two copies
+ofDi. For most cases, we can use sequence numbers to detect any duplications: Each side
+maintains a counter indicating which sequence number it expects next and discards any
+message that does not match the expected window range of sequence numbers. One case of
+duplication requires special attention, however: it is possible for the client to send multiple
+connection requests, with one or more requests or acknowledgments being dropped. The
+server must track the host address and port number of each connection request and discard
+any for which that combination of host and port already has an established connection.
+
+One feature of this epoch design is that there will be at least one message transmitted
+in each direction between client and server on every epoch. As a final feature, we will
+track at the endpoint of each connection the number of epochs that have passed since a
+message (of any type) was received from the other end. Once this count reaches a specified
+EpochLimit, which we denote with the symbolK, we will declare that the connection has
+
+been lost. Our implementation uses a default value of 5 forK; thus, if nothing is received
+from the other end of an established connection over a total period ofK·δseconds, then
+the connection should be assumed lost. Note, if the epoch limit is reached when the client
+is attempting to establish connection with the server, then the client should close.
+
+Heartbeats:There may be epochs in which the client or server has no data messages they
+need to send, but they are still alive and running. As described above, in the case that
+there are no data messages to send or resend in an epoch, we send a “Heartbeat” message,
+which is an acknowledgment with sequence number 0. These heartbeat messages ensure
+that the client does not think the server has timed out and vice versa. Without these
+heartbeat messages, if the server and client stay idle forK·δseconds, they will consider
+each other lost.
+
+2.1.4 Data Size
+
+In networking, the packet length is often unknown. Sometimes the data in the packet is
+of variable length. Sometimes multiple pieces of variable length data are contiguous, and
+a size is used to skip from one piece to the next. In this project, we only worry about
+the first case, where there is one piece of variable length data. If the size of the data is
+not included, and some bytes are lost in transmission, the receiver would not be able to
+know of the data loss. Although in your LSP implementation, Go’smarshallingtakes care
+of this for us, we want to send the size before data in case the protocol is ever extended.
+As a basic data integrity check, if the size of the received data is shorter than the given
+size included in the message, the message should be rejected, i.e. it should be as if the
+message was dropped and the server never received the message. If the size of the data
+is longer than the given size, there is no “correct” behavior, but one such solution, which
+LSP should employ, is to simply truncate the data to the correct length.
+
+2.1.5 Checksum
+
+Checksum is used to detect potential errors introduced during the transmission or storage
+of the data. If the checksum of the received Data message is different from the checksum
+included in the message, the message is considered as corrupted and thus should be rejected.
+
+There are many checksum algorithms such as MD5 and SHA-1. In this project, we will
+introduce a simple UDP checksum algorithm. The algorithm will be provided to you in
+checksum.go. This algorithm computes the 16-bit one’s complement sum of the Data
+message as follows:
+
+Step 1: Separate Data message into blocks of 16-bit values. If the message has odd number
+of bytes, we can pad it with a zero byte, 0x00.
+
+Step 2: Sum up all the 16-bit values two at a time. After each addition, if a carry bit is
+produced, add it to the least significant bit.
+
+Step 3: Take the one’s complement of the final sum. In the above example, the final
+sum is1100 0010 0100 1100, so the checksum of the Data message would be0011 1101
+
+To make your life easier, we have provided the following function in checksum.go that you
+can use directly to compute the checksum value.
+
+/*
+
+* Calculate the 16-bit checksum of the given fields for one data message.
+*/
+func CalculateChecksum(connID, seqNum, size int, payload []byte) uint
+2.2 LSP API
+We will now describe LSP from the perspective of a Go programmer. You must implement
+theexactAPI discussed below to facilitate automated testing, and to ensure compatibility
+between different implementations of the protocol.
+
+The LSP API can be found in thelsp package (included as part of the starter code).
+This package defines several exported structs, interfaces, and constants, and also provides
+detailed documentation describing the intent and expected behavior of every aspect of the
+APIConsult it regularly! ̇
+
+2.2.1 LSP Messages
+
+The different LSP message types are defined as integer constants below:
+
+type MsgType int
+const (
+MsgConnect MsgType = iota // Sent by clients to make a connection w/ the server.
+MsgData // Sent by clients/servers to send data.
+MsgAck // Sent by clients/servers to ack connect/data msgs.
+MsgCAck // Cumulative acknowledgment from client or server.
+)
+Each LSP message consists of six fields, and is declared as a Gostruct:
+
+type Message struct {
+Type MsgType // One of the message types listed above.
+ConnID int // Unique client-server connection ID.
+SeqNum int // Message sequence number.
+Size int // Size of the payload.
+Checksum uint16 // Message checksum.
+Payload []byte // Data message payload.
+}
+To send aMessageover the network, you must first convert the structure to a UDP packet
+bymarshalling it into a sequence of bytes. This can be done in Go using theMarshal
+function in thejsonpackage.
+
+2.2.2 LSP Parameters
+
+For both the client and the server, the API provides a mechanism to specify the epoch limit
+K, the epoch durationδ, the sliding window sizeω, and the max unacked messagesM
+when a client or server is first created. These parameters are encapsulated in the following
+struct:
+
+type Params struct {
+EpochLimit int // Default value is 5.
+EpochMillis int // Default value is 2000.
+WindowSize int // Default value is 1.
+MaxBackOffInterval int // Default value is 0.
+MaxUnackedMessages int // Default value is 1.
+}
+2.2.3 LSP Client API
+
+An application calls theNewClientto set up and initiate the activities of a client. The
+function blocks until a connection with the server has been made, and returns a non-nil
+error if the connection could not be established. The function is declared as follows:
+
+func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error)
+The LSP client API is defined by theClientinterface, which declares the methods below:
+
+ConnID() int
+Read() ([]byte, error)
+Write(payload []byte) error
+Close() error
+TheClient interface hides all the details of establishing a connection, acknowledging
+messages, and handling epochs from the application programmer. Instead, applications
+simply read and write data messages to the network by calling theReadandWritemethods
+respectively. The connection can be signaled for shutdown by callingClose.
+
+A few other details are worth noting:
+
+Readfunction should only return data messages or errors. It should block until data
+has been received from the server and is ready to be returned. It should return a
+non-nilerror if any of the following cases are satisfied:
+The connection has been explicitly closed.
+The connection has been lost due to an epoch timeout and no other messages
+are waiting to be returned byRead.
+The server is closed. Note that in this case, it is also ok for Read to never return
+anything.
+If theReadfunction gets called multiple times, we expect all messages received from
+the server to be returned byReadin order bySeqNumwithout skipping or repeating
+anySeqNum.
+Writefunction shouldnot block. It should return a non-nilerror only if the con-
+nection to the server has been lost or if the Client was closed.
+Closeshould not forcefully terminate the connection, but instead should block until
+all pending messages to the server have been sent and acknowledged (of course, if the
+connection is suddenly lost during this time, the remaining pending messages should
+simply be discarded).
+No goroutine should be left running afterClosehas returned (this may cause our
+Gradescope tests to hang).
+You may assume thatRead,Write, andClosewill not be called afterClosehas been
+called.
+For detailed documentation describing the intent and expected behavior of each function
+and method, consult theclient_api.goandclient_impl.gofiles.
+
+2.2.4 LSP Server API
+
+The API for the server is similar to that for an LSP client, with a few minor differences.
+An application calls theNewServerto set up and initiate an LSP server. However, unlike
+NewClient, this function shouldnotblock. Instead, it should simply begin listening on the
+specified port and spawn one or more goroutines to handle things like accepting incoming
+client connections, triggering epoch events at fixed intervals, etc. If there is a problem
+setting up the server, the function should return a non-nilerror. The function is declared
+as follows:
+
+func NewServer(port int, params *Params) (Server, error)
+The LSP server API is defined by theServerinterface, which declares the following meth-
+ods:
+
+Read() (int, []byte, error)
+Write(connID int, payload []byte) error
+CloseConn(connID int) error
+Close() error
+Similar to theClient, theServerinterface allows applications to both read and write
+data to its clients. Note, however, that because the server can be connected to several LSP
+clients at once, theWriteandCloseConnmethods take a client’s unique connection ID as
+an argument, indicating the connection that should be written to or that should be closed.
+
+A few other details are worth noting:
+
+Readfunction should only return data messages from clients or errors. It should
+block until data has been received from some client and is ready to be returned. It
+should return a non-nilerror if any of the following cases is satisfied:
+1. The connection to some client has been explicitly closed, i.e. whenCloseConn
+is called on a connection.
+2. The connection to some client has been lost due to an epoch timeout and no
+other messages from that client are waiting to be returned byRead.
+3. Close() has been called on the server.
+This method should not return data from a connection that was explicitly closed by
+a call toCloseConn.
+IfReadfunction gets called for multiple times, we expect all messages received from
+a particular client to be returned byReadin order bySeqNumwithout skipping or
+repeating anySeqNum. We do not specify any particular ordering between messages
+received from different clients.
+Example: The server has clients c1, c2, and has received messages m1, m2 from each
+client.
+Examples of valid orderings: [c1m1, c1m2, c2m1, c2m2], [c1m1, c2m1, c1m2, c2m2]
+Examples of invalid orderings: [c1m1, c2m2, c1m2, c2m1], [c1m2, c1m1, c2m1, c2m2]
+TheWriteandCloseConnmethods shouldnot block, and should both return a
+non-nilerror value only if the specified connection ID does not exist.
+Closeshould block until all pending messages to each client have been sent and
+acknowledged (of course, if a client that still has pending messages is suddenly lost
+during this time, the remaining pending messages should simply be discarded).
+No goroutine should be left running afterClosehas returned (this may cause our
+Gradescope tests to hang).
+You may assume that afterCloseConnhas been called, neitherWritenorCloseConn
+will be called on that same connection ID again. You may also assume that no other
+Servermethods calls will be made afterClosehas been called.
+For detailed documentation describing the intent and expected behavior of each function
+and method, consult theserver_api.goandserver_impl.gofiles.
+
+2.3 Starter Code
+We will use GitHub classroom to distribute the starter code for this project. The link to
+register for the project is available on the Edstem project release post.
+
+For instructions on how to build, run, test, and submit your server implementation, see
+theREADME.mdfile in the project’s root directory.
+
+Part A starter code can be found in thesrc/github.com/cmu440/directory, and is orga-
+nized as follows:
+
+Thelsp package contains the API, tests, and the starter code you will need to
+complete:
+- Theclient_api.go,server_api.go,message.go, andparams.gofiles collec-
+tively define the LSP APITo facilitate automated testing, you ̇ must notmodify
+these files.
+- Theclient_impl.gofile contains a skeletal implementation of theClientthat
+you will write.
+- Theserver_impl.gofile contains a skeletal implementation of theServerthat
+you will write.
+- The*_test.gofiles contain the tests that we will run on Gradescope to test
+and evaluate your final submission.
+- Thechecksum.gofile defines the helper functions you will need to compute the
+16-bit one’s complement checksum.
+Thelspnetpackage contains all the UDP operations you will need to complete this
+assignment. To import, useimport "github.com/cmu440/lspnet". You will not
+need and are not permitted to use thenetpackage. Under-the-hood, thelspnet
+package provides some additional functionalities that allow us to more easily grade
+the robustness of your implementation.
+Thesrunner(server-runner) andcrunner(client-runner) packages each provide sim-
+ple executable programs that you may use for your own testing purposes. The project
+README contains instructions on how these programs can be used.
+We have also provided pre-compiled executables of thesrunnerandcrunnerprograms
+discussed above that you can use for testing. The binaries were compiled against our
+reference LSP implementation, so you might find them useful in the early stages of the
+development process (for example, if you wanted to test yourClientimplementation but
+haven’t finished implementing theServeryet, etc.). Instructions on how these programs
+can be used are posted in the project’sREADME.mdfile on GitHub.
+
+In addition to the starter code we provide, you may create your own utility files if you
+wish. For example, it might be a good idea to create acommon.gofile and use it to store
+code that can be shared between both yourClientandServerimplementations.
+
+3 Diagrams
+These diagrams are to try to help you get started and think about how to structure your
+goroutines. Keep it mind that it is important to design and plan out your structure carefully
+before writing code!
+
+Server: Startup routine goes to Read and main routine. The read routine listens for packets - new clients and messages(data + Acks) from existing clients.Main routine processes reads, writes, epocs, etc
+
+Client: Startup routine connects to server goes to read and main routine. Read routine listens for messages(data + Acks) from server. Main routine processes reads, writes, epocs, etc
+
+4 Checkpoint: Read/Write Server
+WARNING:This checkpoint ismuchless work than the rest of Part APlease plan ac- ̇
+cordingly.
+
+Epochs are a necessary aspect of the LSP protocol due to imperfect networks: there is
+no way to prevent messages being dropped, we can only detect a dropped message and
+retransmit it. For the checkpoint, we will assume the network is perfect and no packet loss
+occurs. Therefore, epoch events are not necessary.
+
+However, although packet loss will not occur, it is possible that messages will be sent out
+of order, and you will need to correct for that.
+
+We will require you to pass all basic tests (TestBasic1-9,TestBasicISN) and 3 out of
+order tests (TestOutOfOrderMsg1-3). For some tests, we will test for race conditions.
+
+WARNING:Even if all of your tests pass for the checkpoint, there is no guarantee that
+the implementation is fully correct.
