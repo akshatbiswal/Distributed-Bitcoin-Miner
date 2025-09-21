@@ -2,10 +2,41 @@
 
 package lsp
 
-import "errors"
+import (
+	"errors"
+	"github.com/cmu440/lspnet"
+)
 
 type client struct {
-	// TODO: implement this!
+	 // fixed
+	 conn         *lspnet.UDPConn
+	 serverAddr   *lspnet.UDPAddr
+	 params       *Params
+ 
+	 // ids & seq nums
+	 connID       int                 // after connect ACK
+	 isn          int                 // initial seq num
+	 nextSendSeq  int                 // starts at isn+1 (client->server stream)
+	 nextRecvSeq  int                 // expected next seq from server
+ 
+	 // send-side state (sliding window)
+	 windowSize   int
+	 maxUnacked   int
+	 inflight     map[int]*Message    // seq -> msg (unACKed)
+	 sendQ        [][]byte            // app payloads waiting for window room
+	 backoff      map[int]int         // seq -> current backoff (epochs since last xmit and target)
+ 
+	 // recv-side reordering
+	 recvBuf      map[int][]byte      // seq -> payload (arrived > expected)
+	 appReadQ     chan []byte         // deliver to Read in-order
+ 
+	 // control channels
+	 appWriteQ    chan []byte         // Write() -> main loop
+	 closeReq     chan struct{}       // Close() -> main loop
+	 closed       chan error          // main loop -> Close() completion
+ 
+	 // epoch/timeouts
+	 epochsSinceHeard int             // for connection loss detection
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -22,11 +53,21 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-	return nil, errors.New("not yet implemented")
+	raddr, err := lspnet.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := lspnet.DialUDP("udp", nil, raddr)
+	if err != nil {
+		return nil, err
+	}
+	c := &client{conn: conn,}
+	return c, nil
+	
 }
 
 func (c *client) ConnID() int {
-	return -1
+	return c.connID
 }
 
 func (c *client) Read() ([]byte, error) {

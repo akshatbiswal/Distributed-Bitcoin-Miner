@@ -2,10 +2,63 @@
 
 package lsp
 
-import "errors"
+import (
+	"errors"
+	"github.com/cmu440/lspnet"
+
+)
 
 type server struct {
-	// TODO: Implement this!
+	// fixed
+    conn          *lspnet.UDPConn
+    params        *Params
+
+    // connection table
+    nextConnID    int
+    conns         map[int]*endpoint         // id -> endpoint
+    byAddr        map[string]int            // "ip:port" -> id (de-dupe connects)
+
+    // app-facing delivery
+    appReadQ      chan serverMsg             // {connID, payload} to return in Read()
+    appErrQ       chan serverErr             // {connID, err} for explicit close/loss
+
+    // control
+    appWriteQ     chan serverWrite           // (connID, payload)
+    closeConnReq  chan int
+    closeAllReq   chan struct{}
+    closed        chan error
+}
+
+type serverMsg struct {
+    connID  int
+    payload []byte
+}
+
+type serverErr struct {
+    connID int
+    err    error
+}
+
+type serverWrite struct {
+    connID  int
+    payload []byte
+}
+
+type endpoint struct {
+    addr         *lspnet.UDPAddr
+    // send-side (server->that client)
+    nextSendSeq  int
+    inflight     map[int]*Message
+    sendQ        [][]byte
+    backoff      map[int]int
+
+    // recv-side (client->server)
+    nextRecvSeq  int
+    recvBuf      map[int][]byte
+
+    // liveness
+    alive        bool
+    epochsSinceHeard int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
