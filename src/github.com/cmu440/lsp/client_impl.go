@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"github.com/cmu440/lspnet"
+	"time"
 )
 
 type client struct {
@@ -41,6 +42,22 @@ type client struct {
 	connAckCh   chan struct{}
 	stopped     chan struct{}
 	readStopped chan struct{}
+
+	// epochs
+	epochTickCh        chan struct{}
+	stopEpochCh        chan struct{}
+	epochsSinceRecv    int
+	sentSinceLastEpoch bool
+	connectEpochs      int
+	backoff            map[int]*backoffState
+	connErrCh          chan error
+
+	serverStart bool
+}
+
+type backoffState struct {
+	currentBackoff int
+	remaining      int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -69,38 +86,52 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		params = NewParams()
 	}
 	c := &client{
-		conn:        conn,
-		serverAddr:  raddr,
-		params:      params,
-		isn:         initialSeqNum,
-		nextSendSeq: initialSeqNum + 1,
-		windowSize:  params.WindowSize,
-		maxUnacked:  params.MaxUnackedMessages,
-		inflight:    make(map[int]*Message),
-		sendQ:       make([][]byte, 0),
-		recvBuf:     make(map[int][]byte),
-		deliverQ:    make([][]byte, 0),
-		appReadCh:   make(chan []byte),
-		appWriteCh:  make(chan []byte),
-		closeReq:    make(chan struct{}),
-		closed:      make(chan error, 1),
-		netInCh:     make(chan Message, 1),
-		connAckCh:   make(chan struct{}, 1),
-		stopped:     make(chan struct{}),
-		readStopped: make(chan struct{}),
+		conn:               conn,
+		serverAddr:         raddr,
+		params:             params,
+		isn:                initialSeqNum,
+		nextSendSeq:        initialSeqNum + 1,
+		windowSize:         params.WindowSize,
+		maxUnacked:         params.MaxUnackedMessages,
+		inflight:           make(map[int]*Message),
+		sendQ:              make([][]byte, 0),
+		recvBuf:            make(map[int][]byte),
+		deliverQ:           make([][]byte, 0),
+		appReadCh:          make(chan []byte),
+		appWriteCh:         make(chan []byte),
+		closeReq:           make(chan struct{}),
+		closed:             make(chan error, 1),
+		netInCh:            make(chan Message, 1),
+		connAckCh:          make(chan struct{}, 1),
+		stopped:            make(chan struct{}),
+		readStopped:        make(chan struct{}),
+		epochTickCh:        make(chan struct{}, 1),
+		stopEpochCh:        make(chan struct{}),
+		epochsSinceRecv:    0,
+		sentSinceLastEpoch: false,
+		connectEpochs:      0,
+		backoff:            make(map[int]*backoffState),
+		connErrCh:          make(chan error, 1),
+		serverStart:        false,
 	}
 
 	// start goroutines
 	go c.readLoop()
 	go c.mainLoop()
-
+	go c.startEpochTimer()
 	if err := c.sendConnect(); err != nil {
 		_ = c.conn.Close()
 		return nil, err
 	}
 
-	<-c.connAckCh
-	return c, nil
+	select {
+	case <-c.connAckCh:
+		c.serverStart = true
+		return c, nil
+	case err := <-c.connErrCh:
+		_ = c.conn.Close()
+		return nil, err
+	}
 }
 
 func (c *client) ConnID() int {
@@ -124,15 +155,6 @@ func (c *client) Write(payload []byte) error {
 	case <-c.stopped:
 		return errors.New("client closed")
 	}
-
-	// go func() {
-	// 	select {
-	// 	case c.appWriteCh <- p:
-	// 	case <-c.stopped:
-	// 		return
-	// 	}
-	// }()
-	// return nil
 }
 
 func (c *client) Close() error {
@@ -166,6 +188,10 @@ func (c *client) sendData(seq int, p []byte) error {
 		return err
 	}
 	c.inflight[seq] = msg
+	if _, ok := c.backoff[seq]; !ok {
+		c.backoff[seq] = &backoffState{currentBackoff: 0, remaining: 0}
+	}
+	c.sentSinceLastEpoch = true
 	return nil
 }
 
@@ -178,13 +204,29 @@ func (c *client) sendMsg(m *Message) error {
 	return err
 }
 
-func (c *client) canSendMore() bool {
-	inflight := len(c.inflight)
-	limit := c.windowSize
-	if c.maxUnacked < limit {
-		limit = c.maxUnacked
+func (c *client) oldestUnacked() (int, bool) {
+	min := 0
+	first := true
+	for seq := range c.inflight {
+		if first || seq < min {
+			min = seq
+			first = false
+		}
 	}
-	return inflight < limit
+	return min, !first
+}
+
+func (c *client) canSendMore() bool {
+	if len(c.inflight) >= c.maxUnacked {
+		return false
+	}
+	//making sure we don't go too far past the oldest unacked
+	if base, ok := c.oldestUnacked(); ok {
+		if c.nextSendSeq-base >= c.windowSize {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *client) tryDrainSends() {
@@ -198,10 +240,13 @@ func (c *client) tryDrainSends() {
 }
 
 func (c *client) processIncoming(m Message) {
+	c.epochsSinceRecv = 0
+
 	switch m.Type {
 	case MsgAck:
 		if c.connID == 0 && m.SeqNum == c.isn {
 			c.connID = m.ConnID
+			c.nextRecvSeq = m.SeqNum + 1
 			select {
 			case c.connAckCh <- struct{}{}:
 			default:
@@ -209,16 +254,27 @@ func (c *client) processIncoming(m Message) {
 			return
 		}
 		delete(c.inflight, m.SeqNum)
+		delete(c.backoff, m.SeqNum)
 
 	case MsgCAck:
 		for s := range c.inflight {
 			if s <= m.SeqNum {
 				delete(c.inflight, s)
+				delete(c.backoff, s)
 			}
 		}
 
 	case MsgData:
-		if m.Size < 0 || m.Size > len(m.Payload) {
+		if m.Size < 0 {
+			return
+		}
+		if len(m.Payload) < m.Size {
+			return
+		}
+		if len(m.Payload) > m.Size {
+			m.Payload = m.Payload[:m.Size]
+		}
+		if CalculateChecksum(c.connID, m.SeqNum, m.Size, m.Payload) != m.Checksum {
 			return
 		}
 		if c.nextRecvSeq == 0 {
@@ -229,7 +285,7 @@ func (c *client) processIncoming(m Message) {
 			return
 		}
 		if m.SeqNum == c.nextRecvSeq {
-			c.deliverQ = append(c.deliverQ, m.Payload[:m.Size])
+			c.deliverQ = append(c.deliverQ, m.Payload)
 			c.sendAck(m.SeqNum)
 			c.nextRecvSeq++
 			for {
@@ -244,7 +300,7 @@ func (c *client) processIncoming(m Message) {
 			}
 			return
 		}
-		c.recvBuf[m.SeqNum] = m.Payload[:m.Size]
+		c.recvBuf[m.SeqNum] = m.Payload
 		c.sendAck(m.SeqNum)
 	}
 }
@@ -288,16 +344,77 @@ func (c *client) mainLoop() {
 
 		case <-c.closeReq:
 			closing = true
+
+		case <-c.epochTickCh:
+			if c.connID == 0 {
+				_ = c.sendConnect()
+				c.connectEpochs++
+				if c.connectEpochs >= c.params.EpochLimit {
+					select {
+					case c.connErrCh <- errors.New("connection timed out"):
+					default:
+					}
+					return
+				}
+			} else {
+				if c.handleEpoch() {
+					return
+				}
+			}
 		}
 	}
 }
 
+func (c *client) handleEpoch() bool {
+	resendHappened := false
+	for seq, msg := range c.inflight {
+		st := c.backoff[seq]
+		if st == nil {
+			st = &backoffState{currentBackoff: 0, remaining: 0}
+			c.backoff[seq] = st
+		}
+		if st.remaining > 0 {
+			st.remaining--
+			continue
+		}
+		_ = c.sendMsg(msg)
+		resendHappened = true
+		if st.currentBackoff == 0 {
+			st.currentBackoff = 1
+		} else {
+			st.currentBackoff *= 2
+			if st.currentBackoff > c.params.MaxBackOffInterval {
+				st.currentBackoff = c.params.MaxBackOffInterval
+			}
+		}
+		st.remaining = st.currentBackoff
+	}
+	if !c.sentSinceLastEpoch && !resendHappened {
+		if c.connID != 0 {
+			_ = c.sendMsg(NewAck(c.connID, 0))
+		}
+	}
+	c.epochsSinceRecv++
+	if c.epochsSinceRecv >= c.params.EpochLimit {
+		_ = c.conn.Close()
+		<-c.readStopped
+		close(c.stopEpochCh)
+		c.closed <- errors.New("epoch timeout")
+		return true
+	}
+	c.sentSinceLastEpoch = false
+	return false
+}
 func (c *client) readLoop() {
 	defer close(c.readStopped)
-	buf := make([]byte, 2048)
+	udpBufSize := 65507
+	buf := make([]byte, udpBufSize)
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
+			if !c.serverStart {
+				continue
+			}
 			return
 		}
 		var m Message
@@ -306,6 +423,24 @@ func (c *client) readLoop() {
 		}
 		select {
 		case c.netInCh <- m:
+		case <-c.stopped:
+			return
+		}
+	}
+}
+
+func (c *client) startEpochTimer() {
+	t := time.NewTicker(time.Duration(c.params.EpochMillis) * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			select {
+			case c.epochTickCh <- struct{}{}:
+			default:
+			}
+		case <-c.stopEpochCh:
+			return
 		case <-c.stopped:
 			return
 		}

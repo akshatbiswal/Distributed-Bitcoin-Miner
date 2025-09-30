@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/cmu440/lspnet"
+	"time"
 )
 
 type server struct {
@@ -34,6 +35,10 @@ type server struct {
 
 	// state
 	closingAll bool
+
+	// epochs
+	epochTickCh chan struct{}
+	stopEpochCh chan struct{}
 }
 
 type serverMsg struct {
@@ -70,6 +75,11 @@ type endpoint struct {
 
 	// close state
 	closing bool
+
+	// epochs
+	epochsSinceRecv    int
+	sentSinceLastEpoch bool
+	backoff            map[int]*backoffState
 }
 
 func NewServer(port int, params *Params) (Server, error) {
@@ -98,10 +108,13 @@ func NewServer(port int, params *Params) (Server, error) {
 		closed:       make(chan error, 1),
 		netInCh:      make(chan netEvent, 1),
 		readyDeliver: make([]serverMsg, 0),
+		epochTickCh:  make(chan struct{}, 1),
+		stopEpochCh:  make(chan struct{}),
 	}
 
 	go s.readLoop()
 	go s.mainLoop()
+	go s.startEpochTimer()
 
 	return s, nil
 }
@@ -122,9 +135,6 @@ func (s *server) Read() (int, []byte, error) {
 
 func (s *server) Write(connId int, payload []byte) error {
 	p := append([]byte(nil), payload...)
-	// go func() {
-	// 	s.appWriteQ <- serverWrite{connID: connId, payload: p}
-	// }()
 	s.appWriteQ <- serverWrite{connID: connId, payload: p}
 	return nil
 }
@@ -140,7 +150,8 @@ func (s *server) Close() error {
 }
 
 func (s *server) readLoop() {
-	buf := make([]byte, 2048)
+	udpBufSize := 65507
+	buf := make([]byte, udpBufSize)
 	for {
 		n, addr, err := s.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -176,6 +187,7 @@ func (s *server) mainLoop() {
 		}
 
 		if s.closingAll && s.allDrained() {
+			close(s.stopEpochCh)
 			_ = s.conn.Close()
 			s.closed <- nil
 			return
@@ -212,6 +224,68 @@ func (s *server) mainLoop() {
 
 		case outCh <- outNext:
 			s.readyDeliver = s.readyDeliver[1:]
+
+		case <-s.epochTickCh:
+			s.handleEpoch()
+
+		}
+	}
+}
+
+func (s *server) handleEpoch() {
+	for id, ep := range s.conns {
+		resend := false
+		for seq, msg := range ep.inflight {
+			st := ep.backoff[seq]
+			if st == nil {
+				st = &backoffState{}
+				ep.backoff[seq] = st
+			}
+			if st.remaining > 0 {
+				st.remaining--
+				continue
+			}
+			_ = s.sendTo(ep.addr, msg)
+			resend = true
+			ep.sentSinceLastEpoch = true
+			if st.currentBackoff == 0 {
+				st.currentBackoff = 1
+			} else if s.params.MaxBackOffInterval > 0 {
+				st.currentBackoff *= 2
+				if st.currentBackoff > s.params.MaxBackOffInterval {
+					st.currentBackoff = s.params.MaxBackOffInterval
+				}
+			}
+			st.remaining = st.currentBackoff
+		}
+		if !ep.sentSinceLastEpoch && !resend && !ep.closing {
+			_ = s.sendTo(ep.addr, NewAck(id, 0))
+		}
+		ep.epochsSinceRecv++
+		if ep.epochsSinceRecv >= s.params.EpochLimit {
+			delete(s.conns, id)
+			for k, v := range s.byAddr {
+				if v == id {
+					delete(s.byAddr, k)
+					break
+				}
+			}
+			dst := s.readyDeliver[:0]
+			for _, it := range s.readyDeliver {
+				if it.connID != id {
+					dst = append(dst, it)
+				}
+			}
+			s.readyDeliver = dst
+			for _, it := range s.readyDeliver {
+				if it.connID != id {
+					dst = append(dst, it)
+				}
+			}
+			s.readyDeliver = dst
+			go func() { s.appErrQ <- serverErr{connID: id, err: errors.New("epoch timeout")} }()
+		} else {
+			ep.sentSinceLastEpoch = false
 		}
 	}
 }
@@ -231,22 +305,31 @@ func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 				sendQ:       make([][]byte, 0),
 				nextRecvSeq: m.SeqNum + 1,
 				recvBuf:     make(map[int][]byte),
+				backoff:     make(map[int]*backoffState),
 			}
 			s.conns[id] = ep
 			s.byAddr[key] = id
+		} else {
+			if ep, ok := s.conns[id]; ok {
+				ep.epochsSinceRecv = 0
+			}
 		}
 		_ = s.sendTo(addr, NewAck(id, m.SeqNum))
 
 	case MsgAck:
 		if ep, ok := s.conns[m.ConnID]; ok {
+			ep.epochsSinceRecv = 0
 			delete(ep.inflight, m.SeqNum)
+			delete(ep.backoff, m.SeqNum)
 		}
 
 	case MsgCAck:
 		if ep, ok := s.conns[m.ConnID]; ok {
+			ep.epochsSinceRecv = 0
 			for seq := range ep.inflight {
 				if seq <= m.SeqNum {
 					delete(ep.inflight, seq)
+					delete(ep.backoff, seq)
 				}
 			}
 		}
@@ -256,10 +339,20 @@ func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 		if !ok {
 			return
 		}
-		if m.Size < 0 || m.Size > len(m.Payload) {
+		ep.epochsSinceRecv = 0
+		if m.Size < 0 {
 			return
 		}
-		p := m.Payload[:m.Size]
+		if len(m.Payload) < m.Size {
+			return
+		}
+		if len(m.Payload) > m.Size {
+			m.Payload = m.Payload[:m.Size]
+		}
+		if CalculateChecksum(m.ConnID, m.SeqNum, m.Size, m.Payload) != m.Checksum {
+			return
+		}
+		//p := m.Payload[:m.Size]
 		_ = s.sendTo(ep.addr, NewAck(m.ConnID, m.SeqNum))
 
 		if ep.closing {
@@ -270,7 +363,7 @@ func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 			return
 		}
 		if m.SeqNum == ep.nextRecvSeq {
-			s.readyDeliver = append(s.readyDeliver, serverMsg{connID: m.ConnID, payload: p})
+			s.readyDeliver = append(s.readyDeliver, serverMsg{connID: m.ConnID, payload: m.Payload})
 			ep.nextRecvSeq++
 			for {
 				if bufp, ok := ep.recvBuf[ep.nextRecvSeq]; ok {
@@ -283,17 +376,31 @@ func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 			}
 			return
 		}
-		ep.recvBuf[m.SeqNum] = p
+		ep.recvBuf[m.SeqNum] = m.Payload
 	}
 }
 
-func (s *server) canSendMore(ep *endpoint) bool {
-	inflight := len(ep.inflight)
-	limit := s.params.WindowSize
-	if s.params.MaxUnackedMessages < limit {
-		limit = s.params.MaxUnackedMessages
+func (s *server) oldestUnacked(ep *endpoint) (int, bool) {
+	min := 0
+	first := true
+	for seq := range ep.inflight {
+		if first || seq < min {
+			min = seq
+			first = false
+		}
 	}
-	return inflight < limit
+	return min, !first
+}
+func (s *server) canSendMore(ep *endpoint) bool {
+	if len(ep.inflight) >= s.params.MaxUnackedMessages {
+		return false
+	}
+	if base, ok := s.oldestUnacked(ep); ok {
+		if ep.nextSendSeq-base >= s.params.WindowSize {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *server) sendData(ep *endpoint, seq int, p []byte) error {
@@ -304,6 +411,10 @@ func (s *server) sendData(ep *endpoint, seq int, p []byte) error {
 		return err
 	}
 	ep.inflight[seq] = msg
+	if _, ok := ep.backoff[seq]; !ok {
+		ep.backoff[seq] = &backoffState{currentBackoff: 0, remaining: 0}
+	}
+	ep.sentSinceLastEpoch = true
 	return nil
 }
 
@@ -333,4 +444,20 @@ func (s *server) allDrained() bool {
 		}
 	}
 	return true
+}
+
+func (s *server) startEpochTimer() {
+	t := time.NewTicker(time.Duration(s.params.EpochMillis) * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			select {
+			case s.epochTickCh <- struct{}{}:
+			default:
+			}
+		case <-s.stopEpochCh:
+			return
+		}
+	}
 }
