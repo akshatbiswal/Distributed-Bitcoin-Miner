@@ -52,6 +52,7 @@ type client struct {
 	backoff            map[int]*backoffState
 	connErrCh          chan error
 
+	// state to deal with server slow start
 	serverStart bool
 }
 
@@ -126,6 +127,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 
 	select {
 	case <-c.connAckCh:
+		// This deals with the server slow start case
 		c.serverStart = true
 		return c, nil
 	case err := <-c.connErrCh:
@@ -138,8 +140,10 @@ func (c *client) ConnID() int {
 	return c.connID
 }
 
+// This function is application facing and returns in order reads fron the server
 func (c *client) Read() ([]byte, error) {
 	select {
+	// appReadCh is the final deistanation for in order messages from server
 	case p := <-c.appReadCh:
 		return p, nil
 	case <-c.stopped:
@@ -147,9 +151,11 @@ func (c *client) Read() ([]byte, error) {
 	}
 }
 
+// This function is application facting and sends whatever payloads is given
 func (c *client) Write(payload []byte) error {
 	p := append([]byte(nil), payload...)
 	select {
+	// We write the message to appWriteCh
 	case c.appWriteCh <- p:
 		return nil
 	case <-c.stopped:
@@ -157,6 +163,9 @@ func (c *client) Write(payload []byte) error {
 	}
 }
 
+// This function is application facing and begins the closing process by updating the
+// closeReq channel and then waits on stopped and closed, which are updated by the read
+// write, and epochTimer goroutines
 func (c *client) Close() error {
 	select {
 	case c.closeReq <- struct{}{}:
@@ -178,6 +187,9 @@ func (c *client) sendAck(seq int) {
 	_ = c.sendMsg(NewAck(c.connID, seq))
 }
 
+// This helper function will send a payload with a specific sequence number
+// by calculating the checksum, then making it a message type of data, and then
+// update inflight and backoff state maps
 func (c *client) sendData(seq int, p []byte) error {
 	if c.connID == 0 {
 		return errors.New("no connID")
@@ -195,6 +207,7 @@ func (c *client) sendData(seq int, p []byte) error {
 	return nil
 }
 
+// This function sends a message by marchalling it and then writting it to the socket
 func (c *client) sendMsg(m *Message) error {
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -204,6 +217,8 @@ func (c *client) sendMsg(m *Message) error {
 	return err
 }
 
+// This function uses the inflight map to get the massage with the lowest
+// sequence number that is still inflight
 func (c *client) oldestUnacked() (int, bool) {
 	min := 0
 	first := true
@@ -216,6 +231,8 @@ func (c *client) oldestUnacked() (int, bool) {
 	return min, !first
 }
 
+// Usses the window size and maxUnacked to determie if any more messages
+// can be sent at this moment
 func (c *client) canSendMore() bool {
 	if len(c.inflight) >= c.maxUnacked {
 		return false
@@ -229,6 +246,7 @@ func (c *client) canSendMore() bool {
 	return true
 }
 
+// Trys to send any messages that are in the sendA
 func (c *client) tryDrainSends() {
 	for c.connID != 0 && c.canSendMore() && len(c.sendQ) > 0 {
 		seq := c.nextSendSeq
@@ -239,11 +257,16 @@ func (c *client) tryDrainSends() {
 	}
 }
 
+// Takes a message(ack, Cack, and data), and updates any buffers/maps, but
+// doesn't do any acutal sending.
 func (c *client) processIncoming(m Message) {
 	c.epochsSinceRecv = 0
 
 	switch m.Type {
 	case MsgAck:
+		// If this is the server ack for connecting to the server
+		// the connId will be 0, and the seqnum will be whatever the
+		// intial ism is
 		if c.connID == 0 && m.SeqNum == c.isn {
 			c.connID = m.ConnID
 			c.nextRecvSeq = m.SeqNum + 1
@@ -253,10 +276,12 @@ func (c *client) processIncoming(m Message) {
 			}
 			return
 		}
+		// remove the seq number from the sending state
 		delete(c.inflight, m.SeqNum)
 		delete(c.backoff, m.SeqNum)
 
 	case MsgCAck:
+		// Same idea as above but loop through all inflight messages
 		for s := range c.inflight {
 			if s <= m.SeqNum {
 				delete(c.inflight, s)
@@ -265,9 +290,13 @@ func (c *client) processIncoming(m Message) {
 		}
 
 	case MsgData:
+		// It puts payload into deliverQ is possible otherwise recvBuf
 		if m.Size < 0 {
 			return
 		}
+		// Based on specifications of the architecture since a payload that
+		// has a size less than the given size is corrupt, if the payload
+		// size is greater than the given size then we just truncate it
 		if len(m.Payload) < m.Size {
 			return
 		}
@@ -280,6 +309,7 @@ func (c *client) processIncoming(m Message) {
 		if c.nextRecvSeq == 0 {
 			c.nextRecvSeq = m.SeqNum
 		}
+		// Already recieved the data assocaited with this seq num
 		if m.SeqNum < c.nextRecvSeq {
 			c.sendAck(m.SeqNum)
 			return
@@ -289,6 +319,7 @@ func (c *client) processIncoming(m Message) {
 			c.sendAck(m.SeqNum)
 			c.nextRecvSeq++
 			for {
+				// The recvBuf has all greater seq numbers
 				p, ok := c.recvBuf[c.nextRecvSeq]
 				if !ok {
 					break
@@ -305,6 +336,9 @@ func (c *client) processIncoming(m Message) {
 	}
 }
 
+// Most of the state changes happen in the main loop
+// all other loops sends things to the main loop and the
+// main loop process all the requests
 func (c *client) mainLoop() {
 	defer func() {
 		close(c.stopped)
@@ -315,6 +349,8 @@ func (c *client) mainLoop() {
 	closing := false
 
 	for {
+		// Try to put the whatever is in the deliverQ into
+		// the appReadCh which is what is read by application
 		if len(c.deliverQ) > 0 {
 			outCh = c.appReadCh
 			outNext = c.deliverQ[0]
@@ -333,12 +369,13 @@ func (c *client) mainLoop() {
 		}
 
 		select {
+		// We can put anything from write into SendQ
 		case p := <-c.appWriteCh:
 			c.sendQ = append(c.sendQ, p)
 
 		case m := <-c.netInCh:
 			c.processIncoming(m)
-
+		// Try to put first element of deliverQ in deliverQ
 		case outCh <- outNext:
 			c.deliverQ = c.deliverQ[1:]
 
@@ -347,6 +384,7 @@ func (c *client) mainLoop() {
 
 		case <-c.epochTickCh:
 			if c.connID == 0 {
+				// We are still trying to connect
 				_ = c.sendConnect()
 				c.connectEpochs++
 				if c.connectEpochs >= c.params.EpochLimit {
@@ -357,6 +395,8 @@ func (c *client) mainLoop() {
 					return
 				}
 			} else {
+				// handle epoch returns true when we need to close
+				// the goroutine because the server is not responding
 				if c.handleEpoch() {
 					return
 				}
@@ -365,6 +405,9 @@ func (c *client) mainLoop() {
 	}
 }
 
+// healper function for the main loop
+// deals with exponential backoff and when nothing is sent from the server
+// if will return true when the server is presumed dead
 func (c *client) handleEpoch() bool {
 	resendHappened := false
 	for seq, msg := range c.inflight {
@@ -377,8 +420,10 @@ func (c *client) handleEpoch() bool {
 			st.remaining--
 			continue
 		}
+		// We are at the epoch when we need to send an ack
 		_ = c.sendMsg(msg)
 		resendHappened = true
+		// changing backoff to 2*oldbackoff unless 0 because 0*2=0
 		if st.currentBackoff == 0 {
 			st.currentBackoff = 1
 		} else {
@@ -389,12 +434,14 @@ func (c *client) handleEpoch() bool {
 		}
 		st.remaining = st.currentBackoff
 	}
+	// Only send ack if we havn't sent anything
 	if !c.sentSinceLastEpoch && !resendHappened {
 		if c.connID != 0 {
 			_ = c.sendMsg(NewAck(c.connID, 0))
 		}
 	}
 	c.epochsSinceRecv++
+	// close evverything assocated with the epoch ticker
 	if c.epochsSinceRecv >= c.params.EpochLimit {
 		_ = c.conn.Close()
 		<-c.readStopped
@@ -405,10 +452,14 @@ func (c *client) handleEpoch() bool {
 	c.sentSinceLastEpoch = false
 	return false
 }
+
+// Waits for data from the server, and just unmarshals it
+// and puts it into the netInCh channell for the main loop
 func (c *client) readLoop() {
 	defer close(c.readStopped)
 	udpBufSize := 65507
 	buf := make([]byte, udpBufSize)
+	// Read, unmarshal, and then send the message
 	for {
 		n, err := c.conn.Read(buf)
 		if err != nil {
@@ -429,6 +480,9 @@ func (c *client) readLoop() {
 	}
 }
 
+// This function uses the go time libary to start a ticker
+// and it just updates a channel whenever a tick comes from another channel
+// and stops whenver one of the stop channels has something put into it
 func (c *client) startEpochTimer() {
 	t := time.NewTicker(time.Duration(c.params.EpochMillis) * time.Millisecond)
 	defer t.Stop()
