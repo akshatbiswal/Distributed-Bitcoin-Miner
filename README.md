@@ -1,206 +1,121 @@
-p1
-==
+# Distributed Bitcoin Miner
 
-This repository contains the starter code for project 1. It also contains
-the tests that we will use to grade your implementation, and two simple echo server/client
-(`srunner` and `crunner`, respectively) programs that you might find useful for your own testing
-purposes. 
+A complete, production-style Go project that simulates a Bitcoin mining pool running on top of a custom reliable UDP protocol. The system demonstrates how to build fault-tolerant distributed services from the transport layer up: clients submit hashing jobs, a central server orchestrates work distribution, and a fleet of miners compete to return the lowest hash.
 
-If at any point you have any trouble with building, installing, or testing your code, the article
-titled [How to Write Go Code](http://golang.org/doc/code.html) is a great resource for understanding
-how Go workspaces are built and organized. You might also find the documentation for the
-[`go` command](http://golang.org/cmd/go/) to be helpful. As always, feel free to post your questions
-on Edstem.
+---
 
-This project was designed for and tested on AFS cluster machines, though you may choose to
-write and build your code locally as well.
+## Why this project is interesting
+- **Custom reliability layer.** Implements a Lightweight Session Protocol (`src/github.com/cmu440/lsp`) with sliding windows, retransmissions, exponential backoff, and epoch-based failure detection to provide TCP-like semantics over UDP.
+- **Resilient work scheduler.** The server (`src/github.com/cmu440/bitcoin/server/server.go`) chunks jobs, load-balances miners, and eagerly redistributes stalled work when nodes drop.
+- **End-to-end ownership.** Covers everything from CLI tooling (`client`, `miner`, `server`) to message serialization and binary packaging (`bin/`).
+- **Well-tested core.** Includes a comprehensive test suite for the transport layer (`src/github.com/cmu440/lsp/lsp*_test.go`) plus sanity binaries for the application protocols.
 
-## Part A
+---
 
-### Testing your code using `srunner` & `crunner`
+## Architecture
 
-To make testing your server a bit easier we have provided two simple echo server/client
-programs called `srunner` and `crunner`. If you look at the source code for the two programs,
-you’ll notice that they import the `github.com/cmu440/lsp` package (in other words, they compile
-against the current state of your LSP implementation). We believe you will find these programs
-useful in the early stages of development when your client and server implementations are
-largely incomplete.
-
-To compile, build, and run these programs, use the `go run` command from inside the directory
-storing the file.
-
-```bash
-go run srunner.go
+```
+client → LSP client → bitcoin server → LSP server → miners
 ```
 
-The `srunner` and `crunner` programs may be customized using command line flags. For more
-information, specify the `-h` flag at the command line. For example,
+- **Client** (`src/github.com/cmu440/bitcoin/client`): CLI that submits a message and nonce search space, then blocks waiting for the best result.
+- **Server** (`src/github.com/cmu440/bitcoin/server`): Maintains miner membership, breaks jobs into 10k-nonce chunks, tracks outstanding work, and replies to clients with the best hash observed.
+- **Miner** (`src/github.com/cmu440/bitcoin/miner`): Joins the pool, brute-forces assigned nonce ranges, and streams intermediate results back to the server.
+- **LSP transport** (`src/github.com/cmu440/lsp`): Shared by all binaries; handles connection lifecycle, ordered delivery, retransmissions, and configurable reliability parameters.
+- **Support binaries** (`bin/`): Pre-built sanity test harnesses for different platforms.
 
-```bash
-$ go run srunner.go -h
-Usage of bin/srunner:
-  -elim=5: epoch limit
-  -ems=2000: epoch duration (ms)
-  -port=9999: port number
-  -rdrop=0: network read drop percent
-  -v=false: show srunner logs
-  -wdrop=0: network write drop percent
-  -wsize=1: window 
-  -maxUnackMessages=1: maximum unacknowledged messages allowed
-  -maxBackoff: maximum interval epoch
+---
+
+## Getting Started
+
+1. **Prerequisites**
+   - Go 1.20+ (module mode is enabled via `src/github.com/cmu440/go.mod`).
+   - macOS/Linux/Windows terminal with access to `go` tooling.
+
+2. **Clone & bootstrap**
+   ```bash
+   git clone <repo-url>
+   cd bitcoin-miner
+   go mod tidy
+   ```
+
+3. **Build all components**
+   ```bash
+   go install github.com/cmu440/bitcoin/server
+   go install github.com/cmu440/bitcoin/miner
+   go install github.com/cmu440/bitcoin/client
+   ```
+
+4. **Run the system**
+   ```bash
+   # Terminal 1 – start the server
+   server 6060
+
+   # Terminal 2 – launch one or more miners
+   miner localhost:6060
+   miner localhost:6060
+
+   # Terminal 3 – submit work
+   client localhost:6060 "distributed-systems" 200000
+   ```
+   The client prints `Result <hash> <nonce>` once the server aggregates responses. If connectivity drops, it prints `Disconnected`.
+
+---
+
+## Testing & Tooling
+
+- **Transport layer tests**
+  ```bash
+  cd src/github.com/cmu440/lsp
+  go test ./...
+  go test -race ./...
+  ```
+- **Application sanity checks**
+  - Build the platform-specific binaries (`go build`) inside `bitcoin/miner` and `bitcoin/client`.
+  - Run the provided harnesses (e.g., `bin/darwin/arm64/ctest`, `bin/darwin/arm64/mtest`) to confirm baseline behavior.
+
+---
+
+## Implementation Highlights
+
+- **Reliable messaging over UDP** (`src/github.com/cmu440/lsp/client_impl.go`, `src/github.com/cmu440/lsp/server_impl.go`)
+  - Connection handshake with randomized ISNs, ACK tracking, and application-facing channels for non-blocking writes.
+  - Sliding window plus `MaxUnackedMessages` enforcement to avoid flooding slow peers.
+  - Epoch timer that triggers retransmissions and connection teardown after configurable limits.
+  - Exponential backoff per-message to handle congestion without global pauses.
+- **Adaptive job scheduler** (`src/github.com/cmu440/bitcoin/server/server.go`)
+  - FIFO request queue for fairness between clients.
+  - Chunking (`chunkSize = 10,000`) to keep miners busy without monopolizing the pool.
+  - Redo queue for in-flight work when miners disconnect or fail to ACK.
+  - Best-hash tracking that only updates when a strictly better candidate is found.
+- **Stateless miners and client UX**
+  - Miners work streaming assignments and can be scaled horizontally without coordination.
+  - Client prints deterministic output expected by grading scripts while gracefully handling server failures.
+
+---
+
+## Repository Layout
+
+```
+README.md
+src/github.com/cmu440/
+ ├── bitcoin/
+ ├── lsp/
+ ├── lspnet/
+ ├── srunner/
+ └── crunner/
+bin/
+sh/
 ```
 
-We have also provided pre-compiled executables for you to use called `srunner_sols` and `crunner_sols`.
-These binaries were compiled against our reference LSP implementation,
-so you might find them useful in the early stages of the development process (for example, if you wanted to test your
-client implementation but haven’t finished implementing the server yet, etc.). Separate binaries are provided for each OS in the `bin/` folder.
+---
 
-As an example, to start an echo server on port `6060` on an AFS cluster machine, execute the following command:
+## Ideas for future work
 
-```sh
-<path_to_p1>/bin/linux/srunner_sols -port=6060
-```
+- Turn the scheduler into a dynamic work-stealing pool.
+- Promote transport parameters to CLI flags to make tuning easier.
+- Wrap the cluster in Docker Compose for one-command demos.
 
-### Running the tests
+---
 
-To test your submission, we will execute the following command from inside the
-`src/github.com/cmu440/lsp` directory for each of the tests (where `TestName` is the
-name of one of the 61 test cases, such as `TestBasic6` or `TestWindow1`):
-
-```sh
-go test -run=TestName
-```
-
-Note that we will execute each test _individually_ using the `-run` flag and by specifying a regular expression
-identifying the name of the test to run. To ensure that previous tests don’t affect the outcome of later tests,
-we recommend executing the tests individually (or in small batches, such as `go test -run=TestBasic` which will
-execute all tests beginning with `TestBasic`) as opposed to all together using `go test`.
-
-On some tests, we will also check your code for race conditions using Go’s race detector:
-
-```sh
-go test -race -run=TestName
-```
-
-We have also provided Gradescope test scripts mocks in `sh/`. When you are inside the
-`src/github.com/cmu440/lsp` directory and execute corresponding script, you can have a rough sense of what your
-score should be like on Gradescope.
-
-### Submitting to Gradescope
-
-As with project 0, we will be using Gradescope to grade your submissions for this project.
-We will run some&mdash;but not all&mdash;of the tests with the race detector enabled.
-
-**Please remove all your print statements before making the submission. The autograder may not work properly with print statements.**
-
-To submit your code to Gradescope, create a `lsp.zip` file containing your LSP implementation as follows:
-
-```sh
-cd src/github.com/cmu440/
-zip -r lsp.zip lsp/
-
-# NOTE: If you're on a Windows machine, use 7-zip to ensure your zip file format is compatible with Linux.
-# See discussion: https://edstem.org/us/courses/84244/discussion/6897281
-```
-
-Keep in mind the submission limits and partner guidelines described in the handout.
-
-## Part B
-
-### Importing the `bitcoin` package
-
-In order to use the starter code we provide in the `hash.go` and `message.go` files, use the
-following `import` statement:
-
-```go
-import "github.com/cmu440/bitcoin"
-```
-
-Once you do this, you should be able to make use of the `bitcoin` package as follows:
-
-```go
-hash := bitcoin.Hash("thom yorke", 19970521)
-
-msg := bitcoin.NewRequest("jonny greenwood", 200, 71010)
-```
-
-### Compiling the `client`, `miner` & `server` programs
-
-To compile the `client`, `miner`, and `server` programs, use the `go install` command
-as follows:
-
-```bash
-# Compile the client, miner, and server programs. The resulting binaries
-# will be located in the $GOPATH/bin directory.
-go install github.com/cmu440/bitcoin/client
-go install github.com/cmu440/bitcoin/miner
-go install github.com/cmu440/bitcoin/server
-
-# Start the server, specifying the port to listen on.
-$HOME/go/bin/server 6060
-
-# Start a miner, specifying the server's host:port.
-$HOME/go/bin/miner localhost:6060
-
-# Start the client, specifying the server's host:port, the message
-# "bradfitz", and max nonce 9999.
-$HOME/go/bin/client localhost:6060 bradfitz 9999
-```
-
-Note that you will need to use the `os.Args` variable in your code to access the user-specified
-command line arguments.
-
-### Run Sanity Tests
-
-We have provided *basic* tests for your miner and client implementations. Note that passing them does not indicate that your implementation is correct, nor does it mean your code will earn full scores on Gradescope. Extra tests are encouraged before you submit your code.
-
-To sanity tests, you need to ensure you have compiled version of `client` and `miner` in the same directories as their respective source files. Do this by running the following commands in the each directory:
-
-```bash
-$ cd src/github.com/cmu440/bitcoin/miner
-$ go build miner.go
-$ cd ../client
-$ go build client.go
-```
-You can then run your code by navigating to the directory for your specific device and running the binaries from there. 
-On an Arm Mac, for example, the command would be:
-```bash
-$ cd bin/darwin/arm64
-$ chmod +x ./ctest ./mtest
-$ ./ctest
-$ ./mtest
-```
-
-### Submitting to Gradescope
-
-**Please remove all your print statements before making the submission. The autograder may not work properly with print statements.**
-
-**On gradescope, all three programs (client, miner, and server) use YOUR lsp implementation, provided in the lsp/ folder of your submitted zip file.**
-
-To submit your code to Gradescope, create a `cmu440.zip` file containing your part A and part B implementation
-as follows:
-
-```sh
-cd src/github.com/
-zip -r cmu440.zip cmu440/
-
-# NOTE: If you're on a Windows machine, use 7-zip to ensure your zip file format is compatible with Linux.
-# See discussion: https://edstem.org/us/courses/84244/discussion/6897281
-```
-
-## Miscellaneous
-
-### Reading the API Documentation
-
-Before you begin the project, you should read and understand all of the starter code we provide.
-To make this experience a little less traumatic (we know, it's a lot :P),
-you can read the documentation in a browser:
-1. Install `godoc` globally, by running the following command **outside** the `src/github.com/cmu440` directory:
-```sh
-go install golang.org/x/tools/cmd/godoc@latest
-```
-2. Start a godoc server by running the following command **inside** the `src/github.com/cmu440` directory:
-```sh
-godoc -http=:6060
-```
-3. While the server is running, navigate to [localhost:6060/pkg/github.com/cmu440](http://localhost:6060/pkg/github.com/cmu440) in a browser.
+_Reach out if you'd like a guided walkthrough or a live demo._
