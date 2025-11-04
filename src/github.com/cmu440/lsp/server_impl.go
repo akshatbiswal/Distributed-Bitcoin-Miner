@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/cmu440/lspnet"
 	"time"
+
+	"github.com/cmu440/lspnet"
 )
 
+// Server definition, manages all endpoints over UDP socket,
+// manages traffic, epochs, input output.
 type server struct {
 	// fixed
 	conn   *lspnet.UDPConn
@@ -82,8 +85,8 @@ type endpoint struct {
 	backoff            map[int]*backoffState
 }
 
-// Sets up all the state to start a new server and starts the new server.
-// This function is application facintg
+// Creates and starts an LSP server bound to the given port
+// Spawns background goroutines for network I/O and epoch handling
 func NewServer(port int, params *Params) (Server, error) {
 	if params == nil {
 		params = NewParams()
@@ -122,7 +125,7 @@ func NewServer(port int, params *Params) (Server, error) {
 	return s, nil
 }
 
-// This is application facing, and returns in roder messages from clients
+// blocks until a message or error is available
 func (s *server) Read() (int, []byte, error) {
 	select {
 	// appReadQ is the final destination for in order messages
@@ -138,8 +141,7 @@ func (s *server) Read() (int, []byte, error) {
 	}
 }
 
-// This function is application facing, and sends the payload and connid
-// to the main loop through the appWriteQ channell
+// enqueues payload for transmission to a specific connection
 func (s *server) Write(connId int, payload []byte) error {
 	p := append([]byte(nil), payload...)
 	// appWriteQ is the entry point for any message to write
@@ -147,20 +149,19 @@ func (s *server) Write(connId int, payload []byte) error {
 	return nil
 }
 
-// Closses a specif connection through a channell
+// closes a specific connection
 func (s *server) CloseConn(connId int) error {
 	go func() { s.closeConnReq <- connId }()
 	return nil
 }
 
-// Closses the entinte server, which is started by a channell
+// closes all connections
 func (s *server) Close() error {
 	s.closeAllReq <- struct{}{}
 	return <-s.closed
 }
 
-// Reads all data from clients, and puts them in a channell that
-// the main loop will read from
+// constantly receives UDP, decodes into messages, then forwards to main channel
 func (s *server) readLoop() {
 	// Max size for a UPD packet
 	udpBufSize := 65507
@@ -180,9 +181,7 @@ func (s *server) readLoop() {
 	}
 }
 
-// For the most part all state changes happen in the main loop
-// other loops will send information into this main loop to get actions
-// completed
+// main connection / processes logic
 func (s *server) mainLoop() {
 	for {
 		// This loop sends any messages to each client if possible
@@ -258,8 +257,8 @@ func (s *server) mainLoop() {
 	}
 }
 
-// Thi function is a helper function for the main loop for when
-// there is an epoch tick
+// handles epoch-based logic required by the spec
+// resends expired inflight messages, sends heartbeats, advances timeouts
 func (s *server) handleEpoch() {
 	for id, ep := range s.conns {
 		resend := false
@@ -324,8 +323,7 @@ func (s *server) handleEpoch() {
 	}
 }
 
-// This function is called by the main loop take a message and
-// perform the necessary operations.
+// decodes messages with the proper handler
 func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 	switch m.Type {
 	case MsgConnect:
@@ -434,8 +432,7 @@ func (s *server) processIncoming(m Message, addr *lspnet.UDPAddr) {
 	}
 }
 
-// Helper function that looks through inflight messages of client
-// and returns the lowest seq number and whether it is the first or not
+// returns smallest unacked sequence number
 func (s *server) oldestUnacked(ep *endpoint) (int, bool) {
 	min := 0
 	first := true
@@ -448,9 +445,7 @@ func (s *server) oldestUnacked(ep *endpoint) (int, bool) {
 	return min, !first
 }
 
-// Helper function that looks at whehher another message can be inflight
-// by looking at the maximum unacked messages and window size(implements)
-// the check for the sliding window algorithm
+// returns whether the connection can transmit another data segment
 func (s *server) canSendMore(ep *endpoint) bool {
 	// MacUnackedMessages < WindowSize, so we check it first
 	if len(ep.inflight) >= s.params.MaxUnackedMessages {
@@ -465,8 +460,7 @@ func (s *server) canSendMore(ep *endpoint) bool {
 	return true
 }
 
-// Sends data to some endpoint and labels that data with some sequence number
-// It also adds the message the necessary maps
+// constructs an MsgData then registers it inflight
 func (s *server) sendData(ep *endpoint, seq int, p []byte) error {
 	id := s.connIDFor(ep.addr)
 	cs := CalculateChecksum(id, seq, len(p), p)
@@ -482,8 +476,7 @@ func (s *server) sendData(ep *endpoint, seq int, p []byte) error {
 	return nil
 }
 
-// This function adds marshaling to writing a specific message to some
-// address
+// encodes a message and writes it to the given UDP address
 func (s *server) sendTo(addr *lspnet.UDPAddr, m *Message) error {
 	b, err := json.Marshal(m)
 	if err != nil {
@@ -493,7 +486,7 @@ func (s *server) sendTo(addr *lspnet.UDPAddr, m *Message) error {
 	return err
 }
 
-// Heapler function to access byAddr without dealing with null.
+// reverse lookup from udp to connid
 func (s *server) connIDFor(addr *lspnet.UDPAddr) int {
 	if addr == nil {
 		return 0
